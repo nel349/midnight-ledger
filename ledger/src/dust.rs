@@ -1436,6 +1436,16 @@ impl<D: DB> DustLocalState<D> {
         })
     }
 
+    /// Diagnostic: get the commitment tree root (None if tree not rehashed).
+    pub fn commitment_root(&self) -> Option<MerkleTreeDigest> {
+        self.commitment_tree.root()
+    }
+
+    /// Diagnostic: get the generation tree root (None if tree not rehashed).
+    pub fn generation_root(&self) -> Option<MerkleTreeDigest> {
+        self.generating_tree.root()
+    }
+
     pub fn generation_info(&self, qdo: &QualifiedDustOutput) -> Option<DustGenerationInfo> {
         Some(
             *self
