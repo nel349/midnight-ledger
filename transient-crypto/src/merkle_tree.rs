@@ -1252,6 +1252,59 @@ mod tests {
         );
     }
 
+    /// Dust-state persistence guard (SDK-001). Pins that a Merkle tree survives
+    /// a serialize → deserialize round-trip with its root intact — for both a
+    /// plain tree AND a collapsed tree (the shape a real dust state carries
+    /// after `replay_events` applies generation collapses). This is the property
+    /// checkpoint resume + cross-device backup depend on: a restored dust state
+    /// must reproduce the same Merkle roots, or spends are rejected (error 170).
+    ///
+    /// The FFI restores via deserialize → `rehash()`; this test asserts that
+    /// path reproduces the root, and separately reports whether deserialize
+    /// alone already suffices (informational — `rehash` is idempotent insurance).
+    fn assert_root_survives_round_trip(tree: MerkleTree<(), InMemoryDB<Sha256>>, label: &str) {
+        let root_before = tree.root().expect("rehashed tree has a root");
+
+        let mut bytes = Vec::new();
+        Serializable::serialize(&tree, &mut bytes).expect("serialize");
+        let restored: MerkleTree<(), InMemoryDB<Sha256>> =
+            Deserializable::deserialize(&mut &bytes[..], 0).expect("deserialize");
+
+        let needs_rehash = restored.root() != Some(root_before);
+        eprintln!("[{label}] deserialize-alone reproduces root: {}", !needs_rehash);
+
+        // The actual FFI path: deserialize → rehash → use. Must reproduce the root.
+        assert_eq!(
+            restored.rehash().root(),
+            Some(root_before),
+            "[{label}] deserialize + rehash must reproduce the original root",
+        );
+    }
+
+    #[test]
+    fn serialize_deserialize_reproduces_root() {
+        // Plain tree.
+        assert_root_survives_round_trip(
+            new_mt::<()>(32)
+                .update(0, &Fr::from(42u64), ())
+                .update(3, &Fr::from(43u64), ())
+                .update(62, &Fr::from(12u64), ())
+                .rehash(),
+            "plain",
+        );
+
+        // Collapsed tree — the shape a live dust state actually serializes.
+        assert_root_survives_round_trip(
+            new_mt::<()>(32)
+                .update(0, &Fr::from(42u64), ())
+                .update(3, &Fr::from(43u64), ())
+                .update(62, &Fr::from(12u64), ())
+                .collapse(0, 61)
+                .rehash(),
+            "collapsed",
+        );
+    }
+
     #[test]
     fn test_collapse_good() {
         let tree = new_mt::<()>(32)
