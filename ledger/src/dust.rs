@@ -1901,6 +1901,53 @@ mod tests {
         assert_eq!(proven_dust_spend.proof.0.len(), DUST_SPEND_PROOF_SIZE);
     }
 
+    /// Guards the two invariants the SDK's post-spend state write-back relies on
+    /// (kuira-crypto-ffi balance_ffi.rs). Removing that write-back caused error 115
+    /// ("UTXO already spent") because the spent UTXO got reselected by the next
+    /// sequential transaction; a comment claimed the write-back caused error 170 by
+    /// "corrupting Merkle roots". Both are pinned here:
+    ///
+    ///  - 115 guard: `spend()` marks the consumed UTXO `pending_until`, so `utxos()`
+    ///    (the selector the balancer uses) excludes it — it can't be respent.
+    ///  - 170 guard: `spend()` does NOT mutate the commitment tree, so the root is
+    ///    byte-identical — the spend proof stays valid against it, no root corruption.
+    #[cfg(feature = "proving")]
+    #[tokio::test]
+    async fn spend_marks_utxo_pending_and_preserves_commitment_root() {
+        use rand::{SeedableRng, rngs::StdRng};
+        use storage::db::InMemoryDB;
+
+        use crate::test_utilities::TestState;
+
+        let mut rng = StdRng::seed_from_u64(0x42);
+        let mut state = TestState::<InMemoryDB>::new(&mut rng);
+        state.give_fee_token(&mut rng, 1).await;
+
+        let utxo = state.dust.utxos().next().expect("a funded dust UTXO");
+        let root_before = state.dust.commitment_root();
+        let spendable_before = state.dust.utxos().count();
+        assert!(spendable_before >= 1);
+
+        let (post_spend, _spend) = state
+            .dust
+            .spend(&state.dust_key, &utxo, 42, state.time)
+            .expect("spend succeeds");
+
+        // 115 guard: the spent UTXO drops out of the selectable set.
+        assert_eq!(
+            post_spend.utxos().count(),
+            spendable_before - 1,
+            "spent UTXO still selectable -> next sequential tx reselects it -> error 115",
+        );
+
+        // 170 guard: the commitment root is unchanged (trees untouched by spend).
+        assert_eq!(
+            root_before,
+            post_spend.commitment_root(),
+            "spend changed the commitment root -> writing back the state would cause error 170",
+        );
+    }
+
     struct WrappedSeed(pub Seed);
     impl<'de> Deserialize<'de> for WrappedSeed {
         fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
