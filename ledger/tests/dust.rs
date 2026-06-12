@@ -297,3 +297,104 @@ async fn test_cycle_transfers() {
     let strictness = WellFormedStrictness::default();
     state.assert_apply(&tx, strictness);
 }
+
+/// VERIFY #1: a multi-UTXO wallet can register all its NIGHT for dust via SEPARATE
+/// registration txs for the SAME night key (one NIGHT input each, to stay under the
+/// time-to-dismiss budget). Confirms (a) the 2nd registration is accepted, and (b)
+/// BOTH UTXOs end up generating dust.
+#[tokio::test]
+async fn test_two_registrations_same_key_both_generate() {
+    let mut rng = StdRng::seed_from_u64(0x77);
+    let mut state: TestState<InMemoryDB> = TestState::new(&mut rng);
+    let strictness = WellFormedStrictness::default();
+    let verifying_key = state.night_key.verifying_key();
+    let addr = UserAddress::from(verifying_key.clone());
+
+    const NIGHT_VAL: u128 = 1_000_000;
+    const DUST_VAL: u128 = NIGHT_VAL * INITIAL_DUST_PARAMETERS.night_dust_ratio as u128;
+
+    // Two separate NIGHT UTXOs under the same night key.
+    state.reward_night(&mut rng, NIGHT_VAL).await;
+    state.reward_night(&mut rng, NIGHT_VAL).await;
+    state.fast_forward(INITIAL_DUST_PARAMETERS.time_to_cap());
+
+    let utxos: Vec<(_, u32)> = state
+        .ledger
+        .utxo
+        .utxos
+        .iter()
+        .map(|sp| (sp.0.intent_hash, sp.0.output_no))
+        .collect();
+    assert_eq!(utxos.len(), 2, "expected 2 NIGHT UTXOs");
+
+    // Build a registration that spends one UTXO (1 input -> 1 output) + registers the key.
+    let make_reg = |state: &TestState<InMemoryDB>, rng: &mut StdRng, ih, ono| {
+        let mut intent = Intent::<(), _, _, _>::empty(rng, state.time);
+        intent.guaranteed_unshielded_offer = Some(Sp::new(UnshieldedOffer {
+            inputs: vec![UtxoSpend {
+                intent_hash: ih,
+                output_no: ono,
+                owner: verifying_key.clone(),
+                type_: NIGHT,
+                value: NIGHT_VAL,
+            }]
+            .into(),
+            outputs: vec![UtxoOutput { owner: addr.clone(), type_: NIGHT, value: NIGHT_VAL }].into(),
+            signatures: vec![].into(),
+        }));
+        intent.dust_actions = Some(Sp::new(DustActions {
+            spends: vec![].into(),
+            registrations: vec![DustRegistration {
+                allow_fee_payment: DUST_VAL,
+                dust_address: Some(Sp::new(DustPublicKey::from(state.dust_key.clone()))),
+                night_key: verifying_key.clone(),
+                signature: None,
+            }]
+            .into(),
+            ctime: state.time,
+        }));
+        let intent = intent
+            .sign(rng, 1, &[state.night_key.clone()], &[], &[state.night_key.clone()])
+            .unwrap();
+        Transaction::from_intents("local-test", [(1, intent)].into_iter().collect())
+    };
+
+    // --- Registration 1: UTXO A ---
+    let tx1 = make_reg(&state, &mut rng, utxos[0].0, utxos[0].1);
+    let r1 = state.apply(&tx1, strictness).unwrap();
+    assert!(matches!(r1, TransactionResult::Success(_)), "reg1 must succeed");
+    let gen_1 = state.dust.utxos().count();
+    let bal_1 = state.dust.wallet_balance(state.time);
+    eprintln!("after reg1: generating_utxos={gen_1}, dust_balance={bal_1}");
+
+    // --- Registration 2: UTXO B, SAME night key, SEPARATE tx ---
+    let tx2 = make_reg(&state, &mut rng, utxos[1].0, utxos[1].1);
+    let r2 = state.apply(&tx2, strictness);
+    eprintln!("reg2 apply ok={:?}", r2.is_ok());
+    let r2 = r2.expect("reg2 (same key, separate tx) must not error");
+    assert!(matches!(r2, TransactionResult::Success(_)), "reg2 must succeed");
+    let gen_2 = state.dust.utxos().count();
+    let bal_2 = state.dust.wallet_balance(state.time);
+    eprintln!("after reg2: generating_utxos={gen_2}, dust_balance={bal_2}");
+
+    assert_eq!(gen_2, 2, "BOTH UTXOs must generate dust after two registrations");
+    assert!(bal_2 > bal_1, "dust balance must grow when the 2nd UTXO is registered");
+
+    // VERIFY the FFI filter's matching key: every generating dust UTXO's
+    // backing_night equals exactly one current NIGHT UTXO's initial_nonce, and the
+    // NIGHT UTXOs NOT matched are the unregistered ones. This is the identity
+    // `dust_filter_unregistered_night` relies on.
+    let backing: Vec<[u8; 32]> = state.dust.utxos().map(|u| u.backing_night.0 .0).collect();
+    let night_matches = state
+        .ledger
+        .utxo
+        .utxos
+        .iter()
+        .filter(|sp| sp.0.type_ == NIGHT)
+        .filter(|sp| backing.contains(&sp.0.initial_nonce().0 .0))
+        .count();
+    assert_eq!(
+        night_matches, 2,
+        "both registered NIGHT UTXOs' initial_nonce must match a dust backing_night"
+    );
+}
